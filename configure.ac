@@ -441,6 +441,31 @@ AC_SUBST(EXPAT_CFLAGS)
 AC_SUBST(EXPAT_LIBS)
 AM_CONDITIONAL(USE_OBEXFTP, [test "$msg_obexftp" = "yes"])
 
+dnl *****************************************************
+dnl *** Check if we should build with CMIS backend ***
+dnl *****************************************************
+AC_ARG_ENABLE(cmis, AS_HELP_STRING([--disable-cmis],[build without CMIS backend]))
+msg_cmis=no
+CMIS_LIBS=
+CMIS_CFLAGS=
+
+if test "x$enable_cmis" != "xno";  then
+  PKG_CHECK_EXISTS(libcmis-c-0.4 >= 0.4, msg_cmis=yes)
+
+  if test "x$msg_cmis" = "xyes"; then
+    PKG_CHECK_MODULES(CMIS, libcmis-c-0.4 >= 0.4)
+    AC_SUBST(CMIS_LIBS)
+    AC_SUBST(CMIS_CFLAGS)
+
+    msg_cmis=yes
+    AC_DEFINE(HAVE_CMIS, 1, [Define to 1 if CMIS is going to be built])
+  else
+    msg_cmis=no
+  fi
+fi
+
+AM_CONDITIONAL(USE_CMIS, [test "$msg_cmis" = "yes"])
+
 dnl *************************
 dnl *** Check for gphoto2 ***
 dnl *************************
@@ -917,6 +942,7 @@ echo "
 	AFC support:                  $msg_afc
         AFP support:                  $msg_afp
         DNS-SD support:               $msg_avahi
+        CMIS support:                 $msg_cmis
 	Build HAL volume monitor:     $msg_hal (with fast init path: $have_hal_fast_init)
 	Build GDU volume monitor:     $msg_gdu
 	Build udisks2 volume monitor: $msg_udisks2

@@ -1,0 +1,5 @@
+[Mount]
+Type=cmis
+Exec=@libexecdir@/gvfsd-cmis
+AutoMount=false
+Scheme=cmis

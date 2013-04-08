@@ -128,6 +128,12 @@ mount_DATA += afp-browse.mount afp.mount
 libexec_PROGRAMS += gvfsd-afp-browse gvfsd-afp
 endif
 
+mount_in_files += cmis.mount.in
+if USE_CMIS
+mount_DATA += cmis.mount
+libexec_PROGRAMS += gvfsd-cmis
+endif
+
 noinst_DATA = $(mount_DATA:.mount=.localmount)
 
 EXTRA_DIST = 				\
@@ -293,6 +299,20 @@ gvfsd_ftp_CPPFLAGS = \
 	-DBACKEND_TYPES='"ftp", G_VFS_TYPE_BACKEND_FTP,'
 
 gvfsd_ftp_LDADD = $(libraries)
+
+gvfsd_cmis_SOURCES = \
+	gvfsbackendcmis.c gvfsbackendcmis.h \
+	daemon-main.c daemon-main.h \
+	daemon-main-generic.c 
+
+gvfsd_cmis_CPPFLAGS = \
+	$(CMIS_CFLAGS) \
+	-DBACKEND_HEADER=gvfsbackendcmis.h \
+	-DDEFAULT_BACKEND_TYPE=cmis \
+	-DMAX_JOB_THREADS=10 \
+	-DBACKEND_TYPES='"cmis", G_VFS_TYPE_BACKEND_CMIS,'
+
+gvfsd_cmis_LDADD = $(CMIS_LIBS) $(libraries)
 
 gvfsd_sftp_SOURCES = \
 	sftp.h \
