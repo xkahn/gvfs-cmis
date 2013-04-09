@@ -20,11 +20,29 @@
  * Author: Cédric Bosdonnat <cbosdonnat@suse.com>
  */
 
+#include <string.h>
+#include <stdio.h>
+#include <glib/gi18n.h>
 #include <glib/gstdio.h>
 
+#include <libcmis-c/error.h>
+#include <libcmis-c/session-factory.h>
+
 #include "gvfsbackendcmis.h"
+#include "gvfskeyring.h"
 
 G_DEFINE_TYPE (GVfsBackendCmis, g_vfs_backend_cmis, G_VFS_TYPE_BACKEND)
+
+static void
+logger (const gchar* domain,
+        GLogLevelFlags level,
+        const gchar* message,
+        gpointer data)
+{
+    FILE* fd = fopen ("/home/cbosdo/gvfscmisbackend.log", "a");
+    fwrite (message, 1, strlen(message), fd);
+    fclose (fd);
+}
 
 static void
 do_mount (GVfsBackend *backend,
@@ -33,19 +51,150 @@ do_mount (GVfsBackend *backend,
           GMountSource *mount_source,
           gboolean is_automount)
 {
-    g_print ("TODO Implement do_mount\n");
+    char *spec_str;
+    const char *host;
+    const char *user;
+    char* username = NULL;
+    char *binding_url = NULL;
+    char *repository_id = NULL;
+    char *password = NULL;
+    gboolean failed = FALSE;
+    GPasswordSave password_save = G_PASSWORD_SAVE_NEVER;
+    char *prompt = NULL;
+
     GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
 
-    /* TODO Setup the proxy settings on libcmis if any */
+    spec_str = g_mount_spec_to_string (mount_spec);
+    g_log ("cmis", G_LOG_LEVEL_DEBUG, "mount_spec: %s\n", spec_str);
+    g_free (spec_str);
 
-    /* TODO Try to create the CMIS session */
-    /* cmis_backend->session = libcmis_createSession( ); */
+    /* In CMIS urls, the host is the url-encoded binding URL */
+    host = g_mount_spec_get (mount_spec, "host");
 
-    g_vfs_backend_set_display_name (backend, "CMIS test");
+    if (host == NULL || *host == 0)
+    {
+        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                          G_IO_ERROR_INVALID_ARGUMENT,
+                          _("Invalid mount spec"));
+        return;
+    }
+    binding_url = g_uri_unescape_string (host, ":/");
 
-    g_vfs_backend_set_mount_spec (backend, mount_spec);
-    g_vfs_backend_set_icon_name (backend, "folder-remote");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
+    /* TODO Get the hostname from the binding_url as display host */
+
+    /* TODO We may have the repository ID encoded after the binding URL.
+       both elements are separated by a '#'. */
+
+    user = g_mount_spec_get (mount_spec, "user");
+
+    /* Ask for username / password if missing */
+    if (!g_vfs_keyring_lookup_password (user,
+                binding_url,
+                NULL,
+                "cmis",
+                NULL,
+                NULL,
+                0,
+                &username,
+                NULL,
+                &password) ||
+         username == NULL ||
+         password == NULL)
+    {
+        GAskPasswordFlags flags = G_ASK_PASSWORD_NEED_PASSWORD;
+        gboolean aborted;
+        if (username == NULL)
+        {
+            prompt = g_strdup_printf (_("Enter password for %s"), binding_url);
+            flags |= G_ASK_PASSWORD_NEED_USERNAME;
+        }
+        else
+            prompt = g_strdup_printf (_("Enter password for %s on %s"), username, binding_url);
+     
+        if (g_vfs_keyring_is_available ())
+            flags |= G_ASK_PASSWORD_SAVING_SUPPORTED;
+
+        if (!g_mount_source_ask_password (
+                    mount_source,
+                    prompt,
+                    user,
+                    NULL,
+                    flags,
+                    &aborted,
+                    &password,
+                    &username,
+                    NULL,
+                    NULL,
+                    &password_save) ||
+            aborted)
+        {
+            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                                 aborted ? G_IO_ERROR_FAILED_HANDLED : G_IO_ERROR_PERMISSION_DENIED,
+                 	       _("Password dialog cancelled"));
+            failed = TRUE;
+        }
+    }
+    
+    if (!failed)
+    {
+        /* TODO Setup the proxy settings on libcmis if any */
+
+        /* Try to create the CMIS session */
+        libcmis_ErrorPtr error = libcmis_error_create ();
+        g_log ("cmis", G_LOG_LEVEL_DEBUG, "about to create session\n");
+        cmis_backend->session = libcmis_createSession (binding_url,
+                repository_id, username, password, NULL, false, error);
+        g_log ("cmis", G_LOG_LEVEL_DEBUG, "createSession finished\n");
+
+        if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
+        {
+            const char* error_type = libcmis_error_getType (error);
+            g_log ("cmis", G_LOG_LEVEL_DEBUG, "Got an error when creating libcmis session: [%]%s\n",
+                    error_type, libcmis_error_getMessage(error));
+            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                                 strcmp (error_type, "permissionDenied") == 0 ?
+                                    G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
+                                 libcmis_error_getMessage (error) );
+        }
+        else
+        {
+            char* display_name;
+
+            /* Save password if we prompted it */
+            if (prompt)
+            {
+                g_vfs_keyring_save_password (username,
+                                             binding_url,
+                                             NULL,
+                                             "cmis",
+                                             NULL,
+                                             NULL,
+                                             0,
+                                             password,
+                                             password_save);
+                g_free (prompt);
+            }
+
+            display_name = g_strdup_printf (_("CMIS: %s on %s"), username, binding_url);
+            g_vfs_backend_set_display_name (backend, display_name);
+            g_free (display_name);
+
+            g_vfs_backend_set_mount_spec (backend, mount_spec);
+            g_vfs_backend_set_icon_name (backend, "folder-remote");
+            g_vfs_backend_set_symbolic_icon_name (backend, "folder-remote-symbolic");
+            g_vfs_job_succeeded (G_VFS_JOB (job));
+        }
+        libcmis_error_free (error);
+    }
+
+    /* Cleanup */
+    g_free (binding_url);
+    if (repository_id != NULL)
+        g_free (repository_id);
+    if (username != NULL)
+        g_free (username);
+    if (password != NULL)
+        g_free (password);
 }
 
 static void
@@ -54,7 +203,10 @@ do_unmount (GVfsBackend *   backend,
             GMountUnmountFlags flags,
             GMountSource *mount_source)
 {
-    g_print ( "TODO Implement do_unmount\n");
+    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
+
+    if (cmis_backend->session)
+        libcmis_session_free (cmis_backend->session);
     g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
@@ -223,10 +375,8 @@ do_pull (GVfsBackend *         backend,
 }
 
 static void
-g_vfs_backend_cmis_init (GVfsBackendCmis *cmis)
+g_vfs_backend_cmis_init (GVfsBackendCmis *cmis_backend)
 {
-    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (object);
-
     cmis_backend->session = NULL; 
 }
 
@@ -239,7 +389,7 @@ g_vfs_backend_cmis_finalize (GObject *object)
     if (cmis_backend->session)
         libcmis_session_free (cmis_backend->session);
     
-    G_OBJECT_CLASS (g_vfs_backend_afp_parent_class)->finalize (object);
+    G_OBJECT_CLASS (g_vfs_backend_cmis_parent_class)->finalize (object);
 }
 
 static void
@@ -270,4 +420,7 @@ g_vfs_backend_cmis_class_init (GVfsBackendCmisClass *klass)
     backend_class->try_query_settable_attributes = try_query_settable_attributes;
     backend_class->set_attribute = do_set_attribute;
     backend_class->pull = do_pull;
+
+    /* Set logger for debugging purpose */
+    g_log_set_handler ("cmis", G_LOG_LEVEL_MASK, logger, NULL); 
 }
