@@ -27,6 +27,7 @@ libgvfscommon_la_SOURCES = 	\
 	gvfsdaemonprotocol.c gvfsdaemonprotocol.h \
 	gvfsicon.h gvfsicon.c \
 	gvfsfileinfo.c gvfsfileinfo.h \
+	gvfsuriutils.c gvfsuriutils.h \
 	$(dbus_built_sources) \
 	$(NULL)
 
@@ -66,6 +67,12 @@ libgvfscommon_dnssd_la_LIBADD =	\
 	$(AVAHI_LIBS) \
 	$(GLIB_LIBS)
 endif
+
+noinst_PROGRAMS = test-uri-utils
+
+test_uri_utils_SOURCES = test-uri-utils.c gvfsuriutils.c gvfsuriutils.h
+test_uri_utils_LDADD = $(GLIB_LIBS)
+test_uri_utils_CFLAGS = $(INCLUDES)
 
 
 EXTRA_DIST = org.gtk.vfs.xml
