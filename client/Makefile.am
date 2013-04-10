@@ -17,7 +17,7 @@ module_flags = -export_dynamic -avoid-version -module -no-undefined -export-symb
 
 gvfsclientincludedir=$(includedir)/gvfs-client/gvfs/
 gvfsclientinclude_HEADERS = \
-	gvfsuriutils.h gvfsurimapper.h \
+	gvfsurimapper.h \
 	$(NULL)
 
 URI_PARSER_SOURCES = \
@@ -37,7 +37,6 @@ vfssources = \
 	gdaemonfilemonitor.c gdaemonfilemonitor.h \
 	gvfsdaemondbus.c gvfsdaemondbus.h \
 	gvfsiconloadable.c gvfsiconloadable.h \
-	gvfsuriutils.c gvfsuriutils.h \
 	gvfsurimapper.c gvfsurimapper.h \
 	$(URI_PARSER_SOURCES) \
 	$(NULL)
@@ -54,12 +53,6 @@ giomodules_LTLIBRARIES = libgvfsdbus.la
 libgvfsdbus_la_LDFLAGS = $(module_flags)
 libgvfsdbus_la_SOURCES = $(vfssources)
 libgvfsdbus_la_LIBADD  = $(vfslibs) ../metadata/libmetadata.la
-
-noinst_PROGRAMS = test-uri-utils
-
-test_uri_utils_SOURCES = test-uri-utils.c gvfsuriutils.c gvfsuriutils.h
-test_uri_utils_LDADD = $(vfslibs)
-test_uri_utils_CFLAGS = $(INCLUDES)
 
 if USE_FUSE
 
