@@ -1,3 +1,4 @@
+
 /* GIO - GLib Input, Output and Streaming Library
  *
  * Copyright (C) 2013 Cédric Bosdonnat <cbosdonnat@suse.com>
@@ -269,7 +270,6 @@ do_mount (GVfsBackend *backend,
     GPasswordSave password_save = G_PASSWORD_SAVE_NEVER;
     char *prompt = NULL;
     GDecodedUri *decoded = NULL;
-    char *display_host = NULL;
 
     GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
 
@@ -293,12 +293,12 @@ do_mount (GVfsBackend *backend,
     decoded = g_vfs_decode_uri (binding_url);
     if (decoded && decoded->host)
     {
-        display_host = g_strdup (decoded->host);
+        cmis_backend->display_name = g_strdup (decoded->host);
         if (decoded)
             g_vfs_decoded_uri_free (decoded);
     }
     else
-        display_host = g_strdup (binding_url);
+        cmis_backend->display_name = g_strdup (binding_url);
 
     user = g_mount_spec_get (mount_spec, "user");
 
@@ -320,11 +320,12 @@ do_mount (GVfsBackend *backend,
         gboolean aborted;
         if (username == NULL)
         {
-            prompt = g_strdup_printf (_("Enter password for %s"), display_host);
+            prompt = g_strdup_printf (_("Enter password for %s"), cmis_backend->display_name);
             flags |= G_ASK_PASSWORD_NEED_USERNAME;
         }
         else
-            prompt = g_strdup_printf (_("Enter password for %s on %s"), username, display_host);
+            prompt = g_strdup_printf (_("Enter password for %s on %s"),
+                                      username, cmis_backend->display_name);
      
         if (g_vfs_keyring_is_available ())
             flags |= G_ASK_PASSWORD_SAVING_SUPPORTED;
@@ -380,7 +381,7 @@ do_mount (GVfsBackend *backend,
                 g_free (prompt);
             }
 
-            display_name = g_strdup_printf (_("CMIS: %s on %s"), username, display_host);
+            display_name = g_strdup_printf (_("CMIS: %s on %s"), username, cmis_backend->display_name);
             g_vfs_backend_set_display_name (backend, display_name);
             g_free (display_name);
 
@@ -398,7 +399,6 @@ do_mount (GVfsBackend *backend,
         g_free (username);
     if (password != NULL)
         g_free (password);
-    g_free (display_host);
 }
 
 static void
@@ -410,7 +410,16 @@ do_unmount (GVfsBackend *   backend,
     GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
 
     if (cmis_backend->session)
+    {
         libcmis_session_free (cmis_backend->session);
+        cmis_backend->session = NULL;
+    }
+
+    if (cmis_backend->display_name)
+    {
+        g_free (cmis_backend->display_name);
+        cmis_backend->display_name = NULL;
+    }
     g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
@@ -723,7 +732,7 @@ do_query_info (GVfsBackend *backend,
 
         /* Not much infos to provide for the mounted server itself */
         g_file_info_set_name (info, "/");
-        g_file_info_set_display_name (info, "FOOBAR");
+        g_file_info_set_display_name (info, cmis_backend->display_name);
 
         /* Repositories can't be edited through CMIS */
         g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, FALSE);
@@ -949,6 +958,7 @@ static void
 g_vfs_backend_cmis_init (GVfsBackendCmis *cmis_backend)
 {
     cmis_backend->session = NULL; 
+    cmis_backend->display_name = NULL;
 }
 
 static void
@@ -959,6 +969,9 @@ g_vfs_backend_cmis_finalize (GObject *object)
     /* Should have been done by do_unmount, but better be sure it's clean */
     if (cmis_backend->session)
         libcmis_session_free (cmis_backend->session);
+
+    if (cmis_backend->display_name)
+        g_free (cmis_backend->display_name);
     
     G_OBJECT_CLASS (g_vfs_backend_cmis_parent_class)->finalize (object);
 }
