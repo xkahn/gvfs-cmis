@@ -43,6 +43,7 @@ struct _GVfsBackendCmis
 {
     GVfsBackend     backend;
     libcmis_SessionPtr session;
+    char* display_name;
 };
 
 struct _GVfsBackendCmisClass
