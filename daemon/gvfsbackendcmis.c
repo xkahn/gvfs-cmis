@@ -41,6 +41,168 @@
 G_DEFINE_TYPE (GVfsBackendCmis, g_vfs_backend_cmis, G_VFS_TYPE_BACKEND)
 
 static void
+repository_to_file_info (libcmis_RepositoryPtr repository,
+                         GFileInfo *info)
+{
+    char *id;
+    char *name;
+    GIcon *icon = NULL;
+    GIcon *symbolic_icon = NULL;
+
+    id = libcmis_repository_getId (repository);
+    name = libcmis_repository_getName (repository);
+
+    g_file_info_set_name (info, id);
+    g_file_info_set_display_name (info, name);
+
+    /* Repositories can't be edited through CMIS */
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, FALSE);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, FALSE);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, FALSE);
+
+    g_file_info_set_file_type (info, G_FILE_TYPE_DIRECTORY);
+	g_file_info_set_content_type (info, "inode/directory");
+
+    icon = g_themed_icon_new ("folder-remote");
+    symbolic_icon = g_themed_icon_new ("folder-remote-symbolic");
+
+    g_file_info_set_icon (info, icon);
+    g_object_unref (icon);
+    g_file_info_set_symbolic_icon (info, symbolic_icon);
+    g_object_unref (symbolic_icon);
+
+    g_free (id);
+    g_free (name);
+}
+
+static void
+cmis_object_to_file_info (libcmis_ObjectPtr object,
+                          GFileInfo *info)
+{
+    char *id;
+    char *name;
+    char *content_type;
+    bool is_folder;
+    bool is_document;
+    GIcon *icon = NULL;
+    GIcon *symbolic_icon = NULL;
+    time_t mod_time;
+    time_t create_time;
+    libcmis_AllowableActionsPtr allowable_actions;
+    bool can_read;
+    bool can_write;
+    bool can_delete;
+    bool can_rename;
+
+    id = libcmis_object_getId (object);
+    name = libcmis_object_getName (object);
+    g_file_info_set_name (info, name);
+    g_file_info_set_display_name (info, name);
+
+    create_time = libcmis_object_getCreationDate (object);
+    g_file_info_set_attribute_uint64 (info,
+                                      G_FILE_ATTRIBUTE_TIME_CREATED,
+                                      create_time);
+    mod_time = libcmis_object_getLastModificationDate (object);
+    g_file_info_set_attribute_uint64 (info,
+                                      G_FILE_ATTRIBUTE_TIME_MODIFIED,
+                                      mod_time);
+
+    /* Don't assume not being a folder means we have a document
+     * as this is no longer true with CMIS v1.1 */
+    is_folder = libcmis_is_folder (object);
+    is_document = libcmis_is_document (object);
+
+    if (is_folder)
+    {
+        content_type = g_strdup ("inode/directory");
+        icon = g_themed_icon_new ("folder");
+        symbolic_icon = g_themed_icon_new ("folder-symbolic");
+        g_file_info_set_file_type (info, G_FILE_TYPE_DIRECTORY);
+    }
+    else if (is_document)
+    {
+        g_file_info_set_file_type (info, G_FILE_TYPE_REGULAR);
+
+        libcmis_DocumentPtr document;
+        long content_size = 0;
+
+        document = libcmis_document_cast (object);
+        content_type = libcmis_document_getContentType (document);
+
+        icon = g_content_type_get_icon (content_type);
+        if (icon == NULL)
+            icon = g_themed_icon_new ("text-x-generic");
+
+        symbolic_icon = g_content_type_get_symbolic_icon (content_type);
+        if (symbolic_icon == NULL)
+            symbolic_icon = g_themed_icon_new ("text-x-generic-symbolic");
+
+        content_size = libcmis_document_getContentLength (document);
+        g_file_info_set_size (info, content_size);
+    }
+
+    /* Set the permissions based on the Allowable Actions*/
+    allowable_actions = libcmis_object_getAllowableActions (object);
+    can_read = libcmis_allowable_actions_isAllowed (object, libcmis_GetContentStream);
+    can_write = libcmis_allowable_actions_isAllowed (object, libcmis_SetContentStream);
+    can_delete = libcmis_allowable_actions_isAllowed (object, libcmis_DeleteObject);
+    can_rename = libcmis_allowable_actions_isAllowed (object, libcmis_UpdateProperties);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
+    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
+    libcmis_allowable_actions_free (allowable_actions);
+   
+    g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ID_FILE, id);
+
+    g_file_info_set_content_type (info, content_type);
+    g_file_info_set_icon (info, icon);
+    g_file_info_set_symbolic_icon (info, symbolic_icon);
+    
+    /* Cleanup */
+    g_free (id);
+    g_free (name);
+    g_free (content_type);
+    g_object_unref (icon);
+    g_object_unref (symbolic_icon);
+}
+
+static gchar*
+extract_repository_from_path (const char* path,
+                              gchar** out_path)
+{
+    gsize max_size = 0;
+    gchar **segments;
+    gchar **it;
+    gchar *repository_id = NULL;
+    GString *out_path_str;
+
+    max_size = strlen (path);
+    segments = g_strsplit (path, "/", 0);
+    out_path_str = g_string_sized_new (max_size);
+    for (it = segments; *it != NULL; it++)
+    {
+        size_t segment_size;
+
+        segment_size = strlen (*it);
+        if (!repository_id && segment_size > 0)
+            repository_id = g_strdup (*it);
+        else if (repository_id)
+        {
+            g_string_append_c (out_path_str, '/');
+            g_string_append (out_path_str, *it);
+        }
+    }
+
+    g_strfreev (segments);
+    *out_path = g_string_free (out_path_str, FALSE);
+
+    return repository_id;
+}
+
+static void
 do_mount (GVfsBackend *backend,
           GVfsJobMount *job,
           GMountSpec *mount_spec,
@@ -216,13 +378,14 @@ do_unmount (GVfsBackend *   backend,
     g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
-static void
+static gboolean
 do_open_for_read (GVfsBackend *backend,
-                  GVfsJobOpenForRead *job,
-                  const char *filename)
+                   GVfsJobOpenForRead *job,
+                   const char *filename)
 {
     g_print ("TODO Implement do_open_for_read\n");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
+    g_vfs_job_set_backend_data (G_VFS_JOB (job), backend, NULL);
+    return TRUE;
 }
 
 static void
@@ -305,134 +468,111 @@ do_query_info (GVfsBackend *backend,
                GFileInfo *info,
                GFileAttributeMatcher *matcher)
 {
-    g_print ("TODO Implement do_query_info\n");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
-}
+    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
+    gchar *repository_id = NULL;
+    gchar *path = NULL;
 
-static void
-repository_to_file_info (libcmis_RepositoryPtr repository,
-                         GFileInfo *info)
-{
-    char *id;
-    char *name;
-    GIcon *icon = NULL;
-    GIcon *symbolic_icon = NULL;
+    g_print ("do_query_info: %s\n", filename);
 
-    id = libcmis_repository_getId (repository);
-    name = libcmis_repository_getName (repository);
-
-    g_file_info_set_name (info, id);
-    g_file_info_set_display_name (info, name);
-
-    /* Repositories can't be edited through CMIS */
-    g_file_info_set_attribute_boolean (info,
-                                       G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE,
-                                       FALSE);
-
-    g_file_info_set_file_type (info, G_FILE_TYPE_DIRECTORY);
-	g_file_info_set_content_type (info, "inode/directory");
-
-    icon = g_themed_icon_new ("folder-remote");
-    symbolic_icon = g_themed_icon_new ("folder-remote-symbolic");
-
-    g_file_info_set_icon (info, icon);
-    g_object_unref (icon);
-    g_file_info_set_symbolic_icon (info, symbolic_icon);
-    g_object_unref (symbolic_icon);
-
-    g_free (id);
-    g_free (name);
-}
-
-static void
-cmis_object_to_file_info (libcmis_ObjectPtr object,
-                          GFileInfo *info)
-{
-    char *id;
-    char *name;
-    char *content_type;
-    bool is_folder;
-    bool is_document;
-    GIcon *icon = NULL;
-    GIcon *symbolic_icon = NULL;
-    time_t mod_time;
-    time_t create_time;
-    libcmis_AllowableActionsPtr allowable_actions;
-    bool can_read;
-    bool can_write;
-    bool can_delete;
-    bool can_rename;
-
-    id = libcmis_object_getId (object);
-    name = libcmis_object_getName (object);
-    g_file_info_set_name (info, name);
-    g_file_info_set_display_name (info, name);
-
-    create_time = libcmis_object_getCreationDate (object);
-    g_file_info_set_attribute_uint64 (info,
-                                      G_FILE_ATTRIBUTE_TIME_CREATED,
-                                      create_time);
-    mod_time = libcmis_object_getLastModificationDate (object);
-    g_file_info_set_attribute_uint64 (info,
-                                      G_FILE_ATTRIBUTE_TIME_MODIFIED,
-                                      mod_time);
-
-    /* Don't assume not being a folder means we have a document
-     * as this is no longer true with CMIS v1.1 */
-    is_folder = libcmis_is_folder (object);
-    is_document = libcmis_is_document (object);
-
-    if (is_folder)
+    if (cmis_backend->session == NULL)
     {
-        content_type = g_strdup ("inode/directory");
-        icon = g_themed_icon_new ("folder");
-        symbolic_icon = g_themed_icon_new ("folder-symbolic");
-    }
-    else if (is_document)
-    {
-        libcmis_DocumentPtr document;
-        long content_size = 0;
-
-        document = libcmis_document_cast (object);
-        content_type = libcmis_document_getContentType (document);
-
-        icon = g_content_type_get_icon (content_type);
-        if (icon == NULL)
-            icon = g_themed_icon_new ("text-x-generic");
-
-        symbolic_icon = g_content_type_get_symbolic_icon (content_type);
-        if (symbolic_icon == NULL)
-            symbolic_icon = g_themed_icon_new ("text-x-generic-symbolic");
-
-        content_size = libcmis_document_getContentLength (document);
-        g_file_info_set_size (info, content_size);
+        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                             G_IO_ERROR_NOT_MOUNTED,
+                       _("CMIS session not initialized"));
+        return;
     }
 
-    /* Set the permissions based on the Allowable Actions*/
-    allowable_actions = libcmis_object_getAllowableActions (object);
-    can_read = libcmis_allowable_actions_isAllowed (object, libcmis_GetContentStream);
-    can_write = libcmis_allowable_actions_isAllowed (object, libcmis_SetContentStream);
-    can_delete = libcmis_allowable_actions_isAllowed (object, libcmis_DeleteObject);
-    can_rename = libcmis_allowable_actions_isAllowed (object, libcmis_UpdateProperties);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
-    libcmis_allowable_actions_free (allowable_actions);
-   
-    g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ID_FILE, id);
+    repository_id = extract_repository_from_path (filename, &path);
 
-    g_file_info_set_content_type (info, content_type);
-    g_file_info_set_icon (info, icon);
-    g_file_info_set_symbolic_icon (info, symbolic_icon);
-    
-    /* Cleanup */
-    g_free (id);
-    g_free (name);
-    g_free (content_type);
-    g_object_unref (icon);
-    g_object_unref (symbolic_icon);
+    if (repository_id)
+    {
+        if (libcmis_session_setRepository (cmis_backend->session, repository_id))
+        {
+            if (!path || strlen(path) == 0)
+            {
+                libcmis_RepositoryPtr repo;
+
+                repo = libcmis_session_getRepository (cmis_backend->session, NULL);
+                if (repo)
+                {
+                    repository_to_file_info (repo, info);
+                    g_vfs_job_succeeded (G_VFS_JOB (job));
+                }
+                else
+                {
+                    g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR,
+                                         _("Failed to get repository infos"));
+                }
+
+                libcmis_repository_free (repo);
+            }
+            else
+            {
+                libcmis_ObjectPtr object;
+                libcmis_ErrorPtr error;
+
+                error = libcmis_error_create ();
+                object = libcmis_session_getObjectByPath (cmis_backend->session, path, error);
+
+                if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
+                {
+                    const char* error_type = libcmis_error_getType (error);
+                    /* TODO Handle NotFound errors */
+                    g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                                         strcmp (error_type, "permissionDenied") == 0 ?
+                                            G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
+                                         libcmis_error_getMessage (error) );
+                }
+                else
+                {
+                    cmis_object_to_file_info (object, info);
+                    g_print ("info filled\n");
+                    g_vfs_job_succeeded (G_VFS_JOB (job));
+                }
+
+                libcmis_error_free (error);
+                libcmis_object_free (object);
+            }
+        }
+        else
+        {
+            char *message;
+            message = g_strdup_printf (_("No such repository: %s"), repository_id);
+            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                                 G_IO_ERROR_NOT_FOUND,
+                                 message );
+            g_free (message);
+        }
+    }
+    else
+    {
+        GIcon *icon = NULL;
+        GIcon *symbolic_icon = NULL;
+
+        /* Not much infos to provide for the mounted server itself */
+        g_file_info_set_name (info, "/");
+        g_file_info_set_display_name (info, "FOOBAR");
+
+        /* Repositories can't be edited through CMIS */
+        g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, FALSE);
+        g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, FALSE);
+        g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, FALSE);
+
+        g_file_info_set_file_type (info, G_FILE_TYPE_DIRECTORY);
+        g_file_info_set_content_type (info, "inode/directory");
+
+        icon = g_themed_icon_new ("folder-remote");
+        symbolic_icon = g_themed_icon_new ("folder-remote-symbolic");
+
+        g_file_info_set_icon (info, icon);
+        g_object_unref (icon);
+        g_file_info_set_symbolic_icon (info, symbolic_icon);
+        g_object_unref (symbolic_icon);
+
+        g_vfs_job_succeeded (G_VFS_JOB (job));
+    }
+
+    g_print ("-do_query_info\n");
 }
 
 static void
@@ -442,13 +582,12 @@ do_enumerate (GVfsBackend *backend,
               GFileAttributeMatcher *matcher,
               GFileQueryInfoFlags query_flags)
 {
+    g_print ("+do_enumerate: %s\n", dirname);
+
     GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
     libcmis_RepositoryPtr repository = NULL;
-    gchar **segments;
-    gchar **it;
     gchar *repository_id = NULL;
-    GString *path = NULL;
-    gsize max_size = 0;
+    gchar *path = NULL;
 
     if (cmis_backend->session == NULL)
     {
@@ -461,26 +600,11 @@ do_enumerate (GVfsBackend *backend,
     /* Split the dirname into repository and path.
      * Repository id will be the first segment, path is what follows.
      * Not having any repository id will just enumerate the repositories. */
-    max_size = strlen (dirname);
-    segments = g_strsplit (dirname, "/", 0);
-    path = g_string_sized_new (max_size);
-    for (it = segments; *it != NULL; it++)
-    {
-        size_t segment_size;
-
-        segment_size = strlen (*it);
-        if (!repository_id && segment_size > 0)
-            repository_id = g_strdup (*it);
-        else if (repository_id)
-        {
-            g_string_append_c (path, '/');
-            g_string_append (path, *it);
-        }
-    }
-    g_strfreev (segments);
+    repository_id = extract_repository_from_path (dirname, &path);
 
     repository = libcmis_session_getRepository (cmis_backend->session, NULL);
-    if (!repository && !repository_id)
+
+    if (!repository && (!repository_id || strlen(repository_id) == 0))
     {
         /* We don't have a repository, then list the repositories as folders,
          * whatever the dirname is */
@@ -518,11 +642,14 @@ do_enumerate (GVfsBackend *backend,
             libcmis_ErrorPtr error;
             libcmis_ObjectPtr object = NULL;
 
-            if (path->len == 0)
-                g_string_append_c (path, '/');
+            if (strlen (path) == 0)
+            {
+                g_free (path);
+                path = g_strdup ("/");
+            }
 
             error = libcmis_error_create ();
-            object = libcmis_session_getObjectByPath (cmis_backend->session, path->str, error);
+            object = libcmis_session_getObjectByPath (cmis_backend->session, path, error);
 
             if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
             {
@@ -580,8 +707,8 @@ do_enumerate (GVfsBackend *backend,
                 }
                 else
                 {
-                    char* message;
-                    message = g_strdup_printf (_("Not a valid directory: %s"), path->str);
+                    char *message;
+                    message = g_strdup_printf (_("Not a valid directory: %s"), path);
                     g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY,
                                          message );
                     g_free (message);
@@ -590,11 +717,21 @@ do_enumerate (GVfsBackend *backend,
 
             libcmis_error_free (error);
         }
+        else
+        {
+            char *message;
+            message = g_strdup_printf (_("No such repository: %s"), repository_id);
+            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+                                 G_IO_ERROR_NOT_FOUND,
+                                 message );
+            g_free (message);
+        }
     }
 
     /* Clean up */
     g_free (repository_id);
-    g_string_free (path, TRUE);
+    g_free (path);
+    g_print ("-do_enumerate\n");
 }
 
 static void
