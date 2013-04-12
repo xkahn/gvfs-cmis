@@ -40,6 +40,26 @@
 
 G_DEFINE_TYPE (GVfsBackendCmis, g_vfs_backend_cmis, G_VFS_TYPE_BACKEND)
 
+/** Internal structure to pass a temporary file and it's stream for
+    read/write operations.
+ */
+struct TmpHandle
+{
+    GFile *file;
+    GFileIOStream *stream;
+};
+
+static void
+output_cmis_error (GVfsJob *job, libcmis_ErrorPtr error)
+{
+    const char* error_type = libcmis_error_getType (error);
+    /* TODO Handle NotFound errors */
+    g_vfs_job_failed (job, G_IO_ERROR,
+                         strcmp (error_type, "permissionDenied") == 0 ?
+                            G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
+                         libcmis_error_getMessage (error) );
+}
+
 static void
 repository_to_file_info (libcmis_RepositoryPtr repository,
                          GFileInfo *info)
@@ -202,6 +222,36 @@ extract_repository_from_path (const char* path,
     return repository_id;
 }
 
+static bool
+is_cmis_session_ready (GVfsBackendCmis *backend, GVfsJob *job)
+{
+    bool success = true;
+    if (backend->session == NULL)
+    {
+        g_vfs_job_failed (job, G_IO_ERROR,
+                             G_IO_ERROR_NOT_MOUNTED,
+                       _("CMIS session not initialized"));
+        success = false;
+    }
+    return success;
+}
+
+size_t write_to_io_stream (const void* ptr, size_t size, size_t nmemb, void* data)
+{
+    size_t read = 0;
+    GFileIOStream *stream = (GFileIOStream*) data;
+    GOutputStream *out_stream;
+    gsize bytes_written = 0;
+
+    out_stream = g_io_stream_get_output_stream (G_IO_STREAM (stream));
+    g_output_stream_write_all (out_stream, ptr,
+            size * nmemb, &bytes_written, NULL, NULL);
+
+    read = bytes_written / size;
+
+    return read;
+}
+
 static void
 do_mount (GVfsBackend *backend,
           GVfsJobMount *job,
@@ -214,7 +264,6 @@ do_mount (GVfsBackend *backend,
     const char *user;
     char* username = NULL;
     char *binding_url = NULL;
-    char *repository_id = NULL;
     char *password = NULL;
     gboolean failed = FALSE;
     GPasswordSave password_save = G_PASSWORD_SAVE_NEVER;
@@ -250,9 +299,6 @@ do_mount (GVfsBackend *backend,
     }
     else
         display_host = g_strdup (binding_url);
-
-    /* TODO We may have the repository ID encoded after the binding URL.
-       both elements are separated by a '#'. */
 
     user = g_mount_spec_get (mount_spec, "user");
 
@@ -311,18 +357,10 @@ do_mount (GVfsBackend *backend,
         /* Try to create the CMIS session */
         libcmis_ErrorPtr error = libcmis_error_create ();
         cmis_backend->session = libcmis_createSession (binding_url,
-                repository_id, username, password, NULL, false, error);
+                NULL, username, password, NULL, false, error);
 
         if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
-        {
-            const char* error_type = libcmis_error_getType (error);
-            g_print ("Got an error when creating libcmis session: [%s]%s\n",
-                    error_type, libcmis_error_getMessage(error));
-            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                                 strcmp (error_type, "permissionDenied") == 0 ?
-                                    G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
-                                 libcmis_error_getMessage (error) );
-        }
+            output_cmis_error (G_VFS_JOB (job), error);
         else
         {
             char* display_name;
@@ -356,8 +394,6 @@ do_mount (GVfsBackend *backend,
 
     /* Cleanup */
     g_free (binding_url);
-    if (repository_id != NULL)
-        g_free (repository_id);
     if (username != NULL)
         g_free (username);
     if (password != NULL)
@@ -378,14 +414,130 @@ do_unmount (GVfsBackend *   backend,
     g_vfs_job_succeeded (G_VFS_JOB (job));
 }
 
-static gboolean
+/** Get the CMIS object using its path. The root path is handled as a folder, not as a repository.
+
+    This function will set errors on the job if needed.
+
+    \return
+        the CMIS object or NULL. The resulting object needs to be freed using libcmis_object_free().
+  */
+libcmis_ObjectPtr get_cmis_object (GVfsJob *job,
+                                   libcmis_SessionPtr session,
+                                   const char *repository_id,
+                                   const char *path)
+{
+    libcmis_ObjectPtr object = NULL;
+
+    if (libcmis_session_setRepository (session, repository_id))
+    {
+        if (path && strlen(path) > 0)
+        {
+            libcmis_ErrorPtr error;
+
+            error = libcmis_error_create ();
+            object = libcmis_session_getObjectByPath (session, path, error);
+
+            if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
+                output_cmis_error (job, error);
+
+            libcmis_error_free (error);
+        }
+    }
+    else
+    {
+        char *message;
+        message = g_strdup_printf (_("No such repository: %s"), repository_id);
+        g_vfs_job_failed (job, G_IO_ERROR,
+                          G_IO_ERROR_NOT_FOUND,
+                          message );
+        g_free (message);
+    }
+    return object;
+}
+
+static void
 do_open_for_read (GVfsBackend *backend,
                    GVfsJobOpenForRead *job,
                    const char *filename)
 {
-    g_print ("TODO Implement do_open_for_read\n");
-    g_vfs_job_set_backend_data (G_VFS_JOB (job), backend, NULL);
-    return TRUE;
+    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
+    struct TmpHandle *handle;
+    GError *gerror = NULL;
+    libcmis_ObjectPtr object = NULL;
+    libcmis_DocumentPtr document = NULL;
+    char *repository_id = NULL;
+    char *path = NULL;
+
+    g_print ("+do_open_for_read: %s\n", filename);
+   
+    if (!is_cmis_session_ready (cmis_backend, G_VFS_JOB (job)))
+        return;
+
+    /* Open a tmp file and put the document content stream in it */
+    handle = g_new (struct TmpHandle, 1);
+    handle->file = g_file_new_tmp ("gvfs-cmis-stream-XXXXXX", &handle->stream, &gerror);
+    if (gerror)
+    {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), gerror );
+        g_error_free (gerror);
+        return;
+    }
+
+    repository_id = extract_repository_from_path (filename, &path);
+    if (!path || strlen (path) == 0)
+    {
+        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_REGULAR_FILE,
+                _("Root folder can't be opened for reading"));
+    }
+    else
+    {
+        object = get_cmis_object (G_VFS_JOB (job), cmis_backend->session, repository_id, path);
+
+        if (object && libcmis_is_document (object))
+        {
+            libcmis_ErrorPtr error;
+
+            document = libcmis_document_cast (object);
+            error = libcmis_error_create ();
+
+            /* Get the content stream and write it to the GIOStream */
+            libcmis_document_getContentStream (document, write_to_io_stream, handle->stream, error);
+
+            if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
+                output_cmis_error (G_VFS_JOB (job), error);
+            else
+            {
+                /* Put the cursor back to the begining for reading */
+                GSeekable *seekable = G_SEEKABLE (handle->stream);
+                g_seekable_seek (seekable, 0, G_SEEK_SET, NULL, &gerror);
+                if (gerror)
+                {
+                    g_vfs_job_failed_from_error (G_VFS_JOB (job), gerror);
+                    g_error_free (gerror);
+                }
+                else
+                {
+                    /* We need to delete the tmp file later, so we need both
+                     * stream and file to be passed around. */
+                    g_vfs_job_open_for_read_set_handle (job, handle);
+                    g_vfs_job_succeeded (G_VFS_JOB (job));
+                }
+            }
+
+            libcmis_object_free (object);
+            libcmis_error_free (error);
+        }
+    }
+    
+    g_print ("-do_open_for_read\n");
+
+    /* Cleanup */
+    if (path)
+        g_free (path);
+    if (repository_id)
+        g_free (repository_id);
+
+    return;
 }
 
 static void
@@ -393,8 +545,27 @@ do_close_read (GVfsBackend *     backend,
                GVfsJobCloseRead *job,
                GVfsBackendHandle handle)
 {
-    g_print ("TODO Implement do_close_read\n");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
+    struct TmpHandle *tmp_handle = (struct TmpHandle*) handle;
+    GError *error = NULL;
+
+    g_print ("+do_close_read\n");
+
+    g_io_stream_close (G_IO_STREAM (tmp_handle->stream), NULL, &error);
+    if (error)
+    {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+        g_error_free (error);
+    }
+    else
+        g_vfs_job_succeeded (G_VFS_JOB (job));
+
+
+    g_file_delete (tmp_handle->file, NULL, NULL);
+    g_object_unref (tmp_handle->file);
+
+    g_free (tmp_handle);
+    
+    g_print ("-do_close_read\n");
 }
 
 static void
@@ -404,8 +575,27 @@ do_read (GVfsBackend *     backend,
          char *            buffer,
          gsize             bytes_requested)
 {
-    g_print ("TODO Implement do_read\n");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
+    struct TmpHandle *tmp_handle = (struct TmpHandle*) handle;
+    GInputStream *in_stream;
+    gsize bytes_read = 0;
+    GError *error = NULL;
+
+    g_print ("+do_read\n");
+    in_stream = g_io_stream_get_input_stream ( G_IO_STREAM (tmp_handle->stream));
+
+    g_input_stream_read_all (in_stream, buffer, bytes_requested, &bytes_read, NULL, &error);
+
+    if (error != NULL)
+    {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+        g_error_free (error);
+    }
+    else
+    {
+        g_vfs_job_read_set_size (job, bytes_read);
+        g_vfs_job_succeeded (G_VFS_JOB (job));
+    }
+    g_print ("-do_read\n");
 }
 
 static void
@@ -472,15 +662,10 @@ do_query_info (GVfsBackend *backend,
     gchar *repository_id = NULL;
     gchar *path = NULL;
 
-    g_print ("do_query_info: %s\n", filename);
+    g_print ("+do_query_info: %s\n", filename);
 
-    if (cmis_backend->session == NULL)
-    {
-        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                             G_IO_ERROR_NOT_MOUNTED,
-                       _("CMIS session not initialized"));
+    if (!is_cmis_session_ready (cmis_backend, G_VFS_JOB (job)))
         return;
-    }
 
     repository_id = extract_repository_from_path (filename, &path);
 
@@ -509,29 +694,16 @@ do_query_info (GVfsBackend *backend,
             else
             {
                 libcmis_ObjectPtr object;
-                libcmis_ErrorPtr error;
 
-                error = libcmis_error_create ();
-                object = libcmis_session_getObjectByPath (cmis_backend->session, path, error);
+                object = get_cmis_object (G_VFS_JOB (job), cmis_backend->session, repository_id, path);
 
-                if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
-                {
-                    const char* error_type = libcmis_error_getType (error);
-                    /* TODO Handle NotFound errors */
-                    g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                                         strcmp (error_type, "permissionDenied") == 0 ?
-                                            G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
-                                         libcmis_error_getMessage (error) );
-                }
-                else
+                if (object)
                 {
                     cmis_object_to_file_info (object, info);
-                    g_print ("info filled\n");
                     g_vfs_job_succeeded (G_VFS_JOB (job));
-                }
 
-                libcmis_error_free (error);
-                libcmis_object_free (object);
+                    libcmis_object_free (object);
+                }
             }
         }
         else
@@ -585,26 +757,18 @@ do_enumerate (GVfsBackend *backend,
     g_print ("+do_enumerate: %s\n", dirname);
 
     GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
-    libcmis_RepositoryPtr repository = NULL;
     gchar *repository_id = NULL;
     gchar *path = NULL;
 
-    if (cmis_backend->session == NULL)
-    {
-        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                             G_IO_ERROR_NOT_MOUNTED,
-                       _("CMIS session not initialized"));
+    if (!is_cmis_session_ready (cmis_backend, G_VFS_JOB (job)))
         return;
-    }
 
     /* Split the dirname into repository and path.
      * Repository id will be the first segment, path is what follows.
      * Not having any repository id will just enumerate the repositories. */
     repository_id = extract_repository_from_path (dirname, &path);
 
-    repository = libcmis_session_getRepository (cmis_backend->session, NULL);
-
-    if (!repository && (!repository_id || strlen(repository_id) == 0))
+    if ((!repository_id || strlen(repository_id) == 0))
     {
         /* We don't have a repository, then list the repositories as folders,
          * whatever the dirname is */
@@ -634,98 +798,68 @@ do_enumerate (GVfsBackend *backend,
     }
     else
     {
-        libcmis_repository_free (repository);
+        libcmis_ObjectPtr object = NULL;
+        libcmis_ErrorPtr error;
+
+        if (strlen (path) == 0)
+        {
+            g_free (path);
+            path = g_strdup ("/");
+        }
 
         /* List the files and folders for the given directory name */
-        if (libcmis_session_setRepository (cmis_backend->session, repository_id))
+        object = get_cmis_object (G_VFS_JOB (job), cmis_backend->session, repository_id, path);
+
+
+        error = libcmis_error_create ();
+
+        if (object && libcmis_is_folder (object))
         {
-            libcmis_ErrorPtr error;
-            libcmis_ObjectPtr object = NULL;
+            libcmis_FolderPtr parent = NULL;
+            libcmis_vector_object_Ptr children = NULL;
 
-            if (strlen (path) == 0)
-            {
-                g_free (path);
-                path = g_strdup ("/");
-            }
-
-            error = libcmis_error_create ();
-            object = libcmis_session_getObjectByPath (cmis_backend->session, path, error);
+            parent = libcmis_folder_cast (object);
+            children = libcmis_folder_getChildren (parent, error);
 
             if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
-            {
-                const char* error_type = libcmis_error_getType (error);
-                /* TODO Handle NotFound errors */
-                g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                                     strcmp (error_type, "permissionDenied") == 0 ?
-                                        G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
-                                     libcmis_error_getMessage (error) );
-            }
+                output_cmis_error (G_VFS_JOB (job), error);
             else
             {
-                if (object && libcmis_is_folder (object))
+                size_t objects_count = 0;
+                size_t i;
+
+                /* Convert all instances of libcmis_Object into GFileInfo */
+                objects_count = libcmis_vector_object_size (children);
+                for (i = 0; i < objects_count; ++i)
                 {
-                    libcmis_FolderPtr parent = NULL;
-                    libcmis_vector_object_Ptr children = NULL;
+                    libcmis_ObjectPtr child;
+                    GFileInfo *info;
 
-                    parent = libcmis_folder_cast (object);
-                    children = libcmis_folder_getChildren (parent, error);
+                    child = libcmis_vector_object_get (children, i);
+                    info = g_file_info_new ();
 
-                    if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
-                    {
-                        const char* error_type = libcmis_error_getType (error);
-                        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                                             strcmp (error_type, "permissionDenied") == 0 ?
-                                                G_IO_ERROR_PERMISSION_DENIED : G_IO_ERROR_FAILED,
-                                             libcmis_error_getMessage (error) );
-                    }
-                    else
-                    {
-                        size_t objects_count = 0;
-                        size_t i;
+                    cmis_object_to_file_info (child, info);
 
-                        /* Convert all instances of libcmis_Object into GFileInfo */
-                        objects_count = libcmis_vector_object_size (children);
-                        for (i = 0; i < objects_count; ++i)
-                        {
-                            libcmis_ObjectPtr child;
-                            GFileInfo *info;
-
-                            child = libcmis_vector_object_get (children, i);
-                            info = g_file_info_new ();
-
-                            cmis_object_to_file_info (child, info);
-
-                            g_vfs_job_enumerate_add_info (job, info);
-                        }
-
-                        g_vfs_job_succeeded (G_VFS_JOB (job));
-                        g_vfs_job_enumerate_done (G_VFS_JOB_ENUMERATE (job));
-                    }
-
-                    libcmis_vector_object_free (children);
-                    libcmis_object_free (object);
+                    g_vfs_job_enumerate_add_info (job, info);
                 }
-                else
-                {
-                    char *message;
-                    message = g_strdup_printf (_("Not a valid directory: %s"), path);
-                    g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY,
-                                         message );
-                    g_free (message);
-                }
+
+                g_vfs_job_succeeded (G_VFS_JOB (job));
+                g_vfs_job_enumerate_done (G_VFS_JOB_ENUMERATE (job));
             }
 
-            libcmis_error_free (error);
+            libcmis_vector_object_free (children);
+            libcmis_object_free (object);
         }
         else
         {
             char *message;
-            message = g_strdup_printf (_("No such repository: %s"), repository_id);
-            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
-                                 G_IO_ERROR_NOT_FOUND,
+            message = g_strdup_printf (_("Not a valid directory: %s"), path);
+            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_DIRECTORY,
                                  message );
             g_free (message);
         }
+
+        libcmis_error_free (error);
     }
 
     /* Clean up */
