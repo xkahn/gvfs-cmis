@@ -48,6 +48,7 @@ struct TmpHandle
 {
     GFile *file;
     GFileIOStream *stream;
+    char *filename;
 };
 
 static void
@@ -237,6 +238,47 @@ is_cmis_session_ready (GVfsBackendCmis *backend, GVfsJob *job)
     return success;
 }
 
+/** Get the CMIS object using its path. The root path is handled as a folder, not as a repository.
+
+    This function will set errors on the job if needed.
+
+    \return
+        the CMIS object or NULL. The resulting object needs to be freed using libcmis_object_free().
+  */
+libcmis_ObjectPtr get_cmis_object (GVfsJob *job,
+                                   libcmis_SessionPtr session,
+                                   const char *repository_id,
+                                   const char *path)
+{
+    libcmis_ObjectPtr object = NULL;
+
+    if (libcmis_session_setRepository (session, repository_id))
+    {
+        if (path && strlen(path) > 0)
+        {
+            libcmis_ErrorPtr error;
+
+            error = libcmis_error_create ();
+            object = libcmis_session_getObjectByPath (session, path, error);
+
+            if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
+                output_cmis_error (job, error);
+
+            libcmis_error_free (error);
+        }
+    }
+    else
+    {
+        char *message;
+        message = g_strdup_printf (_("No such repository: %s"), repository_id);
+        g_vfs_job_failed (job, G_IO_ERROR,
+                          G_IO_ERROR_NOT_FOUND,
+                          message );
+        g_free (message);
+    }
+    return object;
+}
+
 size_t write_to_io_stream (const void* ptr, size_t size, size_t nmemb, void* data)
 {
     size_t read = 0;
@@ -358,7 +400,7 @@ do_mount (GVfsBackend *backend,
         /* Try to create the CMIS session */
         libcmis_ErrorPtr error = libcmis_error_create ();
         cmis_backend->session = libcmis_createSession (binding_url,
-                NULL, username, password, NULL, false, error);
+                NULL, username, password, false, NULL, false, error);
 
         if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
             output_cmis_error (G_VFS_JOB (job), error);
@@ -421,47 +463,6 @@ do_unmount (GVfsBackend *   backend,
         cmis_backend->display_name = NULL;
     }
     g_vfs_job_succeeded (G_VFS_JOB (job));
-}
-
-/** Get the CMIS object using its path. The root path is handled as a folder, not as a repository.
-
-    This function will set errors on the job if needed.
-
-    \return
-        the CMIS object or NULL. The resulting object needs to be freed using libcmis_object_free().
-  */
-libcmis_ObjectPtr get_cmis_object (GVfsJob *job,
-                                   libcmis_SessionPtr session,
-                                   const char *repository_id,
-                                   const char *path)
-{
-    libcmis_ObjectPtr object = NULL;
-
-    if (libcmis_session_setRepository (session, repository_id))
-    {
-        if (path && strlen(path) > 0)
-        {
-            libcmis_ErrorPtr error;
-
-            error = libcmis_error_create ();
-            object = libcmis_session_getObjectByPath (session, path, error);
-
-            if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL)
-                output_cmis_error (job, error);
-
-            libcmis_error_free (error);
-        }
-    }
-    else
-    {
-        char *message;
-        message = g_strdup_printf (_("No such repository: %s"), repository_id);
-        g_vfs_job_failed (job, G_IO_ERROR,
-                          G_IO_ERROR_NOT_FOUND,
-                          message );
-        g_free (message);
-    }
-    return object;
 }
 
 static void
@@ -613,8 +614,55 @@ do_create (GVfsBackend *backend,
            const char *filename,
            GFileCreateFlags flags)
 {
-    g_print ("TODO Implement do_create\n");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
+    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
+    struct TmpHandle *handle;
+    GError *gerror = NULL;
+    char *repository_id = NULL;
+    char *path = NULL;
+    libcmis_ObjectPtr object = NULL;
+
+    g_print ("+do_create: %s\n", filename);
+
+    if (!is_cmis_session_ready (cmis_backend, G_VFS_JOB (job)))
+        return;
+
+    /* Create a temporary file to get the content before pushing it to the server */
+    handle = g_new (struct TmpHandle, 1);
+    handle->file = g_file_new_tmp ("gvfs-cmis-stream-XXXXXX", &handle->stream, &gerror);
+    handle->filename = g_strdup (filename);
+    if (gerror)
+    {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), gerror);
+        g_error_free (gerror);
+        return;
+    }
+
+    repository_id = extract_repository_from_path (filename, &path);
+    if (!path || strlen (path) == 0)
+    {
+        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_REGULAR_FILE,
+                _("Root folder can't be opened for writing"));
+    }
+    else
+    {
+        /* Make sure that the object exists */
+        object = get_cmis_object (G_VFS_JOB (job), cmis_backend->session, repository_id, path);
+
+        if (object && libcmis_is_document (object))
+        {
+            g_vfs_job_open_for_write_set_can_seek (job, TRUE);
+            g_vfs_job_open_for_write_set_handle (job, handle);
+            g_vfs_job_succeeded (G_VFS_JOB (job));
+        }
+        else
+        {
+            g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_REGULAR_FILE,
+                    _("Can't be opened for writing"));
+        }
+
+    }
+
+    g_print ("-do_create\n");
 }
 
 static void
@@ -644,8 +692,44 @@ do_close_write (GVfsBackend *backend,
                 GVfsJobCloseWrite *job,
                 GVfsBackendHandle handle)
 {
-    g_print ("TODO Implement do_close_write\n");
-    g_vfs_job_succeeded (G_VFS_JOB (job));
+    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
+    struct TmpHandle *tmp_handle = (struct TmpHandle*) handle;
+    GError *error = NULL;
+    char *repository_id = NULL;
+    char *path = NULL;
+    libcmis_ObjectPtr object = NULL;
+
+    g_print ("+do_close_write\n");
+
+    /* TODO Set the content stream */
+    
+    if (!is_cmis_session_ready (cmis_backend, G_VFS_JOB (job)))
+        return;
+
+    repository_id = extract_repository_from_path (tmp_handle->filename, &path);
+    object = get_cmis_object (G_VFS_JOB (job), cmis_backend->session, repository_id, path);
+
+    if (object && libcmis_is_document (object))
+    {
+        libcmis_DocumentPtr document = libcmis_document_cast (object);
+        /* libcmis_document_setContentStream (document, read_from_io_stream, handle->stream, ); */
+    }
+
+    /* Close the streams and delete the tmp file */
+    g_io_stream_close (G_IO_STREAM (tmp_handle->stream), NULL, &error);
+    if (error)
+    {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
+        g_error_free (error);
+    }
+    else
+        g_vfs_job_succeeded (G_VFS_JOB (job));
+
+
+    g_file_delete (tmp_handle->file, NULL, NULL);
+    g_object_unref (tmp_handle->file);
+    g_free (tmp_handle->filename);
+    g_free (tmp_handle);
 }
 
 static void
