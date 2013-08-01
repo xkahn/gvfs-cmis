@@ -249,6 +249,7 @@ char *
 g_vfs_encode_uri (GDecodedUri *decoded, gboolean allow_utf8)
 {
   GString *uri;
+  gchar *host_encode_allowed;
 
   uri = g_string_new (NULL);
 
@@ -264,10 +265,15 @@ g_vfs_encode_uri (GDecodedUri *decoded, gboolean allow_utf8)
 				       G_URI_RESERVED_CHARS_ALLOWED_IN_USERINFO, allow_utf8);
 	  g_string_append_c (uri, '@');
 	}
-      
+
+      /* Allowed unescaped in hostname / ip address */
+      host_encode_allowed = G_URI_RESERVED_CHARS_SUBCOMPONENT_DELIMITERS;
+      if (decoded->host[0] == '[' && decoded->host[strlen(decoded->host) - 1] == ']')
+    {
+        host_encode_allowed = G_URI_RESERVED_CHARS_SUBCOMPONENT_DELIMITERS ":[]";
+    }
       g_string_append_uri_escaped (uri, decoded->host,
-				   /* Allowed unescaped in hostname / ip address */
-				   G_URI_RESERVED_CHARS_SUBCOMPONENT_DELIMITERS ":[]" ,
+				   host_encode_allowed,
 				   allow_utf8);
       
       if (decoded->port != -1)
