@@ -166,15 +166,21 @@ cmis_object_to_file_info (libcmis_ObjectPtr object,
 
     /* Set the permissions based on the Allowable Actions*/
     allowable_actions = libcmis_object_getAllowableActions (object);
-    can_read = libcmis_allowable_actions_isAllowed (object, libcmis_GetContentStream);
-    can_write = libcmis_allowable_actions_isAllowed (object, libcmis_SetContentStream);
-    can_delete = libcmis_allowable_actions_isAllowed (object, libcmis_DeleteObject);
-    can_rename = libcmis_allowable_actions_isAllowed (object, libcmis_UpdateProperties);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
-    g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
+    can_read = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_GetContentStream);
+    can_write = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_SetContentStream);
+    can_delete = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_DeleteObject);
+    can_rename = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_UpdateProperties);
+
+    if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_GetContentStream)) {
+      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
+      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
+    }
+    if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_SetContentStream))
+      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
+    if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_DeleteObject)) {
+      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
+      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
+    }
     libcmis_allowable_actions_free (allowable_actions);
    
     g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ID_FILE, id);
