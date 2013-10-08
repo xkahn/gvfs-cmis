@@ -115,11 +115,13 @@ cmis_object_to_file_info (libcmis_ObjectPtr object,
     GIcon *symbolic_icon = NULL;
     time_t mod_time;
     time_t create_time;
+    libcmis_vector_property_Ptr plist;
     libcmis_AllowableActionsPtr allowable_actions;
     bool can_read;
     bool can_write;
     bool can_delete;
     bool can_rename;
+    int i;
 
     id = libcmis_object_getId (object);
     name = libcmis_object_getName (object);
@@ -149,10 +151,10 @@ cmis_object_to_file_info (libcmis_ObjectPtr object,
     }
     else if (is_document)
     {
-        g_file_info_set_file_type (info, G_FILE_TYPE_REGULAR);
-
         libcmis_DocumentPtr document;
         long content_size = 0;
+
+        g_file_info_set_file_type (info, G_FILE_TYPE_REGULAR);
 
         document = libcmis_document_cast (object);
         content_type = libcmis_document_getContentType (document);
@@ -193,7 +195,74 @@ cmis_object_to_file_info (libcmis_ObjectPtr object,
     g_file_info_set_content_type (info, content_type);
     g_file_info_set_icon (info, icon);
     g_file_info_set_symbolic_icon (info, symbolic_icon);
+
+    /* Insert raw metadata into the object so others can get it. */
     
+    plist = libcmis_object_getProperties(object);
+    for (i = 0; libcmis_vector_property_get(plist, i); i++) {
+      libcmis_vector_string_Ptr vs;
+      libcmis_vector_bool_Ptr vb;
+      libcmis_vector_long_Ptr vl;
+      libcmis_vector_double_Ptr vd;
+      libcmis_vector_time_Ptr vt;
+
+      gchar *nt;
+
+      libcmis_PropertyPtr p = libcmis_vector_property_get(plist, i);
+      libcmis_PropertyTypePtr ptype = libcmis_property_getPropertyType(p);
+      gchar *title =  g_strdup_printf ("cmis::%s", g_strdup(libcmis_property_type_getId(ptype)));
+      switch (libcmis_property_type_getType(ptype)) {
+      case libcmis_String:
+	vs = libcmis_property_getStrings(p);
+	if (libcmis_vector_string_size(vs) > 1) 
+	  g_print ("cmis_object_to_file_info: Property %s (string) is using multivalue; not yet supported\n", title);
+	g_file_info_set_attribute_string (info, title, libcmis_vector_string_get(vs, 0));
+	libcmis_vector_string_free(vs);
+	break;
+	
+      case libcmis_Integer:
+	vl = libcmis_property_getLongs(p);
+	if (libcmis_vector_long_size(vl) > 1) 
+	  g_print ("cmis_object_to_file_info: Property %s (integer) is using multivalue; not yet supported\n", title);
+	g_file_info_set_attribute_int64 (info, title, libcmis_vector_long_get(vl, 0));
+	libcmis_vector_long_free(vl);
+	break;
+
+      case libcmis_Decimal:
+	vd = libcmis_property_getDoubles(p);
+	if (libcmis_vector_double_size(vd) > 1) 
+	  g_print ("cmis_object_to_file_info: Property %s (double) is using multivalue; not yet supported\n", title);
+	nt = g_strdup_printf ("[d] %f", libcmis_vector_double_get(vd, 0));
+	g_file_info_set_attribute_string (info, title, nt);
+	g_free (nt);
+	libcmis_vector_double_free(vd);
+	break;
+
+      case libcmis_Bool:
+	vb = libcmis_property_getBools(p);
+	if (libcmis_vector_bool_size(vb) > 1)
+	  g_print ("cmis_object_to_file_info: Property %s (bool) is using multivalue; not yet supported\n", title);
+	g_file_info_set_attribute_boolean (info, title, libcmis_vector_bool_get(vb, 0));
+	libcmis_vector_bool_free(vb);
+	break;
+
+      case libcmis_DateTime:
+	vt = libcmis_property_getDateTimes(p);
+	if (libcmis_vector_time_size(vt) > 1) 
+	  g_print ("cmis_object_to_file_info: Property %s (double) is using multivalue; not yet supported\n", title);
+	nt = g_strdup_printf ("[t] %d", libcmis_vector_time_get(vt, 0));
+	g_file_info_set_attribute_string (info, title, nt);
+	g_free (nt);
+	libcmis_vector_time_free (vt);
+	break;
+
+      default:
+	g_print ("cmis_object_to_file_info: (II) type '%s' received for %s was not supported\n", libcmis_property_type_getXmlType(ptype), title);
+	break;
+      }
+
+    }
+
     /* Cleanup */
     g_free (id);
     g_free (name);
