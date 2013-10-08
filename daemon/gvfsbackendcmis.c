@@ -584,6 +584,7 @@ do_open_for_read (GVfsBackend *backend,
     {
         g_vfs_job_failed_from_error (G_VFS_JOB (job), gerror );
         g_error_free (gerror);
+	g_free (handle);
         return;
     }
 
@@ -592,6 +593,7 @@ do_open_for_read (GVfsBackend *backend,
     {
         g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_REGULAR_FILE,
                 _("Root folder can't be opened for reading"));
+	g_free (handle);
     }
     else
     {
