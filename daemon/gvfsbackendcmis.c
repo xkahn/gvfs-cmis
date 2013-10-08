@@ -30,9 +30,14 @@
 #include <libcmis-c/error.h>
 #include <libcmis-c/folder.h>
 #include <libcmis-c/object.h>
+#include <libcmis-c/object-type.h>
 #include <libcmis-c/repository.h>
 #include <libcmis-c/session.h>
 #include <libcmis-c/session-factory.h>
+#include <libcmis-c/property.h>
+#include <libcmis-c/property-type.h>
+#include <libcmis-c/types.h>
+#include <libcmis-c/vectors.h>
 
 #include <gvfsuriutils.h>
 #include "gvfsbackendcmis.h"
@@ -293,6 +298,20 @@ size_t write_to_io_stream (const void* ptr, size_t size, size_t nmemb, void* dat
     gsize bytes_written = 0;
 
     out_stream = g_io_stream_get_output_stream (G_IO_STREAM (stream));
+    g_output_stream_write_all (out_stream, ptr,
+            size * nmemb, &bytes_written, NULL, NULL);
+
+    read = bytes_written / size;
+
+    return read;
+}
+
+size_t write_to_g_output_stream (const void* ptr, size_t size, size_t nmemb, void* data)
+{
+    size_t read = 0;
+    GOutputStream *out_stream = (GOutputStream*) data;
+    gsize bytes_written = 0;
+
     g_output_stream_write_all (out_stream, ptr,
             size * nmemb, &bytes_written, NULL, NULL);
 
@@ -611,7 +630,33 @@ do_read (GVfsBackend *     backend,
         g_vfs_job_read_set_size (job, bytes_read);
         g_vfs_job_succeeded (G_VFS_JOB (job));
     }
-    g_print ("-do_read\n");
+}
+
+static void
+do_seek_on_read (GVfsBackend *backend,
+                  GVfsJobSeekRead *job,
+                  GVfsBackendHandle handle,
+                  goffset    offset,
+                  GSeekType  type)
+{
+  GError *error = NULL;
+  struct TmpHandle *tmp_handle = (struct TmpHandle*) handle;
+
+  g_print ("+do_seek_on_read: (handle = '%lx', offset = %ld) \n", (long int)handle, (long int)offset);
+
+  g_assert (tmp_handle != NULL);
+
+  if (g_seekable_seek (G_SEEKABLE (G_IO_STREAM (tmp_handle->stream)), offset, type, G_VFS_JOB (job)->cancellable, &error)) {
+    g_vfs_job_seek_read_set_offset (job, g_seekable_tell (G_SEEKABLE (G_IO_STREAM (tmp_handle->stream))));
+    g_print ("(II) try_seek_on_read success. \n");
+  } else  {
+    g_vfs_job_failed_from_error (G_VFS_JOB (job), error); 
+    g_print ("  (EE) try_seek_on_read: g_file_input_stream_seek() failed, error: %s \n", error->message);
+    g_error_free (error);
+  }
+  
+  g_print ("-do_seek_on_read\n");
+
 }
 
 static void
@@ -1033,15 +1078,94 @@ do_set_attribute (GVfsBackend *backend,
 static void
 do_pull (GVfsBackend *         backend,
          GVfsJobPull *         job,
-         const char *          source,
+         const char *          filename,
          const char *          local_path,
          GFileCopyFlags        flags,
          gboolean              remove_source,
          GFileProgressCallback progress_callback,
          gpointer              progress_callback_data)
 {
-    g_print ("TODO Implement do_pull\n");
+    GVfsBackendCmis *cmis_backend = G_VFS_BACKEND_CMIS (backend);
+    GError *gerror = NULL;
+    libcmis_ObjectPtr object = NULL;
+    libcmis_DocumentPtr document = NULL;
+    char *repository_id = NULL;
+    char *path = NULL;
+    libcmis_ErrorPtr error;
+    GFile *file;
+    GFileOutputStream *stream;
+
+    g_print ("+do_pull\n");
+    if (!is_cmis_session_ready (cmis_backend, G_VFS_JOB (job)))
+        return;
+
+    file = g_file_new_for_path (local_path);
+    if (flags & G_FILE_COPY_OVERWRITE)
+      stream = g_file_replace (file,
+			       NULL, /* We don't have etags */
+			       flags & G_FILE_COPY_BACKUP ? TRUE : FALSE,
+			       G_FILE_CREATE_REPLACE_DESTINATION,
+			       NULL, /* We can't cancel yet */
+			       &gerror);
+    else
+      stream = g_file_create (file,
+			      G_FILE_CREATE_NONE,
+			      NULL, /* We can't cancel yet */
+			      &gerror);
+    
+    if (stream == NULL) 
+      {
+	g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR,
+			  G_IO_ERROR_INVALID_ARGUMENT,
+			  _("File could not be created"));
+	goto do_pull_finish;
+      }
+
+    repository_id = extract_repository_from_path (filename, &path);
+    if (!path || strlen (path) == 0)
+    {
+        g_vfs_job_failed (G_VFS_JOB (job), G_IO_ERROR, G_IO_ERROR_NOT_REGULAR_FILE,
+                _("Root folder can't be opened for reading"));
+	goto do_pull_finish;
+    }
+    
+    object = get_cmis_object (G_VFS_JOB (job), cmis_backend->session, repository_id, path);
+
+    if (!object || !libcmis_is_document (object))
+      {
+	output_cmis_error (G_VFS_JOB (job), error);
+	goto do_pull_finish;
+      }
+
+    document = libcmis_document_cast (object);
+    error = libcmis_error_create ();
+    
+    /* Get the content stream and write it to the GIOStream */
+    libcmis_document_getContentStream (document, write_to_g_output_stream, stream, error);
+    
+    if (libcmis_error_getMessage (error) != NULL || libcmis_error_getType(error) != NULL) 
+      {
+	output_cmis_error (G_VFS_JOB (job), error);
+	goto do_pull_finish;
+      }
+    
+    g_output_stream_close ((GOutputStream*) stream, NULL, &gerror);
+    if (gerror)
+      {
+        g_vfs_job_failed_from_error (G_VFS_JOB (job), gerror);
+	goto do_pull_finish;
+      }
+
+    if (remove_source)
+      {
+	/* FIXME: We need to initiate a delete operation */
+      }
+
     g_vfs_job_succeeded (G_VFS_JOB (job));
+
+ do_pull_finish:
+    g_object_unref (file);
+    g_print ("-do_pull\n");
 }
 
 static void
@@ -1080,6 +1204,7 @@ g_vfs_backend_cmis_class_init (GVfsBackendCmisClass *klass)
     backend_class->open_for_read = do_open_for_read;
     backend_class->close_read = do_close_read;
     backend_class->read = do_read;
+    backend_class->seek_on_read = do_seek_on_read;
     backend_class->create = do_create;
     backend_class->append_to = do_append;
     backend_class->replace = do_replace;
