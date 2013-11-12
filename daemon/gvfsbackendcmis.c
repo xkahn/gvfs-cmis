@@ -39,7 +39,7 @@
 #include <libcmis-c/types.h>
 #include <libcmis-c/vectors.h>
 
-#include <gvfsuriutils.h>
+#include "../client/gvfsuriutils.h"
 #include "gvfsbackendcmis.h"
 #include "gvfskeyring.h"
 #include "gvfsjobenumerate.h"
@@ -148,6 +148,25 @@ cmis_object_to_file_info (libcmis_ObjectPtr object,
         icon = g_themed_icon_new ("folder");
         symbolic_icon = g_themed_icon_new ("folder-symbolic");
         g_file_info_set_file_type (info, G_FILE_TYPE_DIRECTORY);
+
+	/* Set the permissions based on the Allowable Actions*/
+	allowable_actions = libcmis_object_getAllowableActions (object);
+	can_read = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_GetChildren);
+	can_write = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_CreateDocument);
+	can_delete = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_DeleteObject);
+	can_rename = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_UpdateProperties);
+
+	if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_GetContentStream)) {
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
+	}
+	if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_SetContentStream))
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
+	if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_DeleteObject)) {
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
+	}
+	libcmis_allowable_actions_free (allowable_actions);
     }
     else if (is_document)
     {
@@ -169,26 +188,26 @@ cmis_object_to_file_info (libcmis_ObjectPtr object,
 
         content_size = libcmis_document_getContentLength (document);
         g_file_info_set_size (info, content_size);
-    }
 
-    /* Set the permissions based on the Allowable Actions*/
-    allowable_actions = libcmis_object_getAllowableActions (object);
-    can_read = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_GetContentStream);
-    can_write = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_SetContentStream);
-    can_delete = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_DeleteObject);
-    can_rename = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_UpdateProperties);
+	/* Set the permissions based on the Allowable Actions*/
+	allowable_actions = libcmis_object_getAllowableActions (object);
+	can_read = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_GetContentStream);
+	can_write = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_SetContentStream);
+	can_delete = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_DeleteObject);
+	can_rename = libcmis_allowable_actions_isAllowed (allowable_actions, libcmis_UpdateProperties);
 
-    if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_GetContentStream)) {
-      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
-      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
+	if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_GetContentStream)) {
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_READ, can_read);
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_RENAME, can_rename);
+	}
+	if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_SetContentStream))
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
+	if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_DeleteObject)) {
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
+	  g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
+	}
+	libcmis_allowable_actions_free (allowable_actions);
     }
-    if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_SetContentStream))
-      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_WRITE, can_write);
-    if (libcmis_allowable_actions_isDefined (allowable_actions, libcmis_DeleteObject)) {
-      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_DELETE, can_delete);
-      g_file_info_set_attribute_boolean (info, G_FILE_ATTRIBUTE_ACCESS_CAN_TRASH, can_delete);
-    }
-    libcmis_allowable_actions_free (allowable_actions);
    
     g_file_info_set_attribute_string (info, G_FILE_ATTRIBUTE_ID_FILE, id);
 
@@ -686,7 +705,7 @@ do_read (GVfsBackend *     backend,
     gsize bytes_read = 0;
     GError *error = NULL;
 
-    g_print ("+do_read\n");
+    g_print ("+do_read: bytes_requested: %d\n", bytes_requested);
     in_stream = g_io_stream_get_input_stream ( G_IO_STREAM (tmp_handle->stream));
 
     g_input_stream_read_all (in_stream, buffer, bytes_requested, &bytes_read, NULL, &error);
@@ -695,12 +714,14 @@ do_read (GVfsBackend *     backend,
     {
         g_vfs_job_failed_from_error (G_VFS_JOB (job), error);
         g_error_free (error);
+	g_print ("=do_read: error\n");
     }
     else
     {
         g_vfs_job_read_set_size (job, bytes_read);
         g_vfs_job_succeeded (G_VFS_JOB (job));
     }
+    g_print ("-do_read: bytes_read: %d\n", bytes_read);
 }
 
 static void
